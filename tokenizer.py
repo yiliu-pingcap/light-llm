@@ -1,5 +1,8 @@
 # tokenizer.py
-# A tiny, dependency-free tokenizer that preserves whitespace so decode() can round-trip.
+# Tiny but more fine-grained tokenizer:
+# - keeps whitespace tokens for round-trip decode()
+# - splits CJK into single characters
+# - supports URL/email, numbers, contractions, emojis/symbols, punctuation
 
 from __future__ import annotations
 
@@ -8,15 +11,36 @@ import json
 import re
 from collections import Counter
 from dataclasses import dataclass
-from typing import Iterable, List, Dict, Optional
+from typing import Dict, Iterable, List, Optional
 
 
+def _is_cjk(ch: str) -> bool:
+    o = ord(ch)
+    # CJK Unified Ideographs + Extensions (partial but practical)
+    return (
+        0x4E00 <= o <= 0x9FFF or
+        0x3400 <= o <= 0x4DBF or
+        0x20000 <= o <= 0x2A6DF or
+        0x2A700 <= o <= 0x2B73F or
+        0x2B740 <= o <= 0x2B81F or
+        0x2B820 <= o <= 0x2CEAF or
+        0xF900 <= o <= 0xFAFF or
+        0x2F800 <= o <= 0x2FA1F
+    )
+
+
+# One pass regex for non-CJK chunks; CJK handled char-by-char in tokenize().
 _TOKEN_RE = re.compile(
     r"""
-    \s+                              | # whitespace (kept)
-    [A-Za-z]+(?:'[A-Za-z]+)?          | # words + simple contractions
-    \d+(?:\.\d+)?                     | # numbers / decimals
-    [^\w\s]                             # punctuation / symbols
+    \s+                                                | # whitespace (kept)
+    https?://[^\s]+                                    | # url
+    www\.[^\s]+                                        | # url-ish
+    [A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}      | # email
+    (?:[A-Za-z]+(?:'[A-Za-z]+)?)                       | # words + contractions
+    (?:\d{1,3}(?:,\d{3})+(?:\.\d+)?)%?                 | # 1,234 / 1,234.56 / optional %
+    (?:\d+(?:\.\d+)?)%?                                | # 12 / 12.3 / optional %
+    [\u2600-\u27BF\U0001F000-\U0001FAFF]               | # emoji/symbol ranges (rough)
+    [^\w\s]                                              # punctuation/symbol
     """,
     re.VERBOSE,
 )
@@ -47,20 +71,36 @@ class Tokenizer:
     def eos_id(self) -> int: return self.token_to_id[self.eos_token]
 
     def tokenize(self, text: str) -> List[str]:
-        return _TOKEN_RE.findall(text)
+        # Split into runs of CJK and non-CJK; CJK -> single char tokens
+        out: List[str] = []
+        buf: List[str] = []
+
+        def flush_buf() -> None:
+            if not buf:
+                return
+            chunk = "".join(buf)
+            out.extend(_TOKEN_RE.findall(chunk))
+            buf.clear()
+
+        for ch in text:
+            if _is_cjk(ch):
+                flush_buf()
+                out.append(ch)  # single char
+            else:
+                buf.append(ch)
+        flush_buf()
+        return out
 
     def fit(self, texts: Iterable[str], min_freq: int = 1, max_vocab: Optional[int] = None) -> None:
         counter = Counter()
         for t in texts:
             counter.update(self.tokenize(t))
 
-        # Reserve spots for specials already in vocab
         specials = set(self.token_to_id.keys())
         items = [(tok, c) for tok, c in counter.items() if c >= min_freq and tok not in specials]
         items.sort(key=lambda x: (-x[1], x[0]))
 
         if max_vocab is not None:
-            # max_vocab includes specials
             keep = max(0, max_vocab - len(self.id_to_token))
             items = items[:keep]
 
@@ -83,7 +123,7 @@ class Tokenizer:
 
     def decode(self, ids: Iterable[int], skip_special_tokens: bool = True) -> str:
         specials = {self.pad_id, self.unk_id, self.bos_id, self.eos_id} if skip_special_tokens else set()
-        toks = []
+        toks: List[str] = []
         for i in ids:
             if i in specials:
                 continue
@@ -125,7 +165,7 @@ def _read_text_file(path: str) -> List[str]:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Tiny regex tokenizer (keeps whitespace).")
+    ap = argparse.ArgumentParser(description="Tiny fine-grained tokenizer (keeps whitespace, CJK char-level).")
     ap.add_argument("--fit", help="Text file to build vocab from (one document per line).")
     ap.add_argument("--min-freq", type=int, default=1)
     ap.add_argument("--max-vocab", type=int, default=None)
